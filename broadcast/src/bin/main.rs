@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use futures_util::future::join_all;
+use futures_util::lock::Mutex;
+use log::info;
 use maelstrom::protocol::MessageBody;
 use maelstrom::{Node, Result, Runtime, done, protocol::Message};
 use serde_json::{Map, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -13,21 +13,23 @@ fn main() -> Result<()> {
 
 async fn try_main() -> Result<()> {
     let runtime = Runtime::new();
-    let bc_handler = BroadcastHandler::new(runtime.node_id());
+    let bc_handler = BroadcastHandler::new();
     let handler = Arc::new(Handler::new(bc_handler));
     runtime.with_handler(handler).run().await
 }
 
 #[derive(Clone)]
 struct Handler {
-    bc_handler: BroadcastHandler,
+    bc_handler: Arc<Mutex<BroadcastHandler>>,
 }
 
 #[async_trait]
 impl Node for Handler {
     async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
         let req_clone = req.clone();
-        if let Ok(_) = self.bc_handler.handle(&runtime, req).await {
+        let mut bc_handler = self.bc_handler.lock().await;
+
+        if let Ok(_) = bc_handler.handle(&runtime, req).await {
             return Ok(());
         }
         done(runtime, req_clone)
@@ -37,28 +39,26 @@ impl Node for Handler {
 impl Handler {
     fn new(bc_handler: BroadcastHandler) -> Handler {
         return Handler {
-            bc_handler: bc_handler,
+            bc_handler: Arc::new(Mutex::new(bc_handler)),
         };
     }
 }
 
 #[derive(Clone)]
 struct BroadcastHandler {
-    node_id: String,
-    topo: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    values: Arc<RwLock<Vec<i64>>>,
+    topo: HashMap<String, Vec<String>>,
+    values: HashSet<i64>,
 }
 
 impl BroadcastHandler {
-    pub fn new(node_id: &str) -> BroadcastHandler {
+    pub fn new() -> BroadcastHandler {
         BroadcastHandler {
-            node_id: String::from(node_id),
-            topo: Arc::new(RwLock::new(HashMap::new())),
-            values: Arc::new(RwLock::new(Vec::new())),
+            topo: HashMap::new(),
+            values: HashSet::new(),
         }
     }
 
-    pub async fn handle(&self, runtime: &Runtime, req: Message) -> Result<()> {
+    pub async fn handle(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
         match req.get_type() {
             "broadcast" => self.hdl_broadcast(runtime, req).await,
             "read" => self.hdl_read(runtime, req).await,
@@ -67,41 +67,40 @@ impl BroadcastHandler {
         }
     }
 
-    async fn hdl_broadcast(&self, runtime: &Runtime, req: Message) -> Result<()> {
-        let topo_guard = self.topo.read().await;
-        let dests = topo_guard.get(self.node_id.as_str());
+    async fn hdl_broadcast(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
+        let dests = self.topo.get(runtime.node_id());
 
-        let msg_body = &req.body.extra;
-        let value = msg_body
+        let msg_body = &req.body;
+        let msg_num = msg_body
+            .extra
             .get("message")
             .expect("Message was not sent")
             .as_i64()
             .expect("Message is not i64");
 
-        if dests.is_some() {
-            let mut futs = Vec::new();
-            for dest in dests.unwrap() {
-                futs.push(runtime.send(dest, msg_body.clone()));
+        if self.values.insert(msg_num) {
+            if dests.is_some() {
+                for dest in dests.unwrap() {
+                    info!(
+                        "Sending msg_id req={} resp={} to dest={} message={}",
+                        req.body.msg_id, msg_body.msg_id, dest, msg_num,
+                    );
+                    let mut send_msg = msg_body.clone();
+                    send_msg
+                        .extra
+                        .insert(String::from("message"), json!(msg_num));
+                    runtime.call_async(dest, send_msg)
+                }
             }
-            join_all(futs).await;
         }
-
-        drop(topo_guard);
-
-        self.values.write().await.push(value);
 
         return runtime.reply_ok(req).await;
     }
 
     async fn hdl_read(&self, runtime: &Runtime, req: Message) -> Result<()> {
-        let values_guard = self.values.read().await;
-        let mut json_values = Vec::new();
-        values_guard
-            .iter()
-            .for_each(|it| json_values.push(json!(it)));
-
         let mut extra = Map::new();
-        extra.insert(String::from("messages"), json!(json_values));
+        extra.insert(String::from("messages"), json!(self.values));
+
         let msg_body = MessageBody::from_extra(extra)
             .and_msg_id(req.body.msg_id)
             .with_reply_to(req.body.in_reply_to)
@@ -110,8 +109,7 @@ impl BroadcastHandler {
         return runtime.reply(req, msg_body).await;
     }
 
-    async fn hdl_topology(&self, runtime: &Runtime, req: Message) -> Result<()> {
-        let mut cur_topo = self.topo.write().await;
+    async fn hdl_topology(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
         let extra = &req.body.extra;
         if let Some(topo_map) = extra.get("topology") {
             if let Some(topo_obj) = topo_map.as_object() {
@@ -122,11 +120,12 @@ impl BroadcastHandler {
                             .filter_map(|v| v.as_str())
                             .map(|s| s.to_string())
                             .collect();
-                        cur_topo.insert(node_id.clone(), neighbor_strings);
+                        self.topo.insert(node_id.clone(), neighbor_strings);
                     }
                 }
             }
         }
+        info!("Broadcast topology: {:?}", self.topo);
 
         return runtime.reply_ok(req).await;
     }
