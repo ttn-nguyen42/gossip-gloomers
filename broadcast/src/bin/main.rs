@@ -3,9 +3,13 @@ use futures_util::lock::Mutex;
 use log::info;
 use maelstrom::protocol::MessageBody;
 use maelstrom::{Node, Result, Runtime, done, protocol::Message};
+use rand::random;
 use serde_json::{Map, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time;
 
 fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -46,14 +50,14 @@ impl Handler {
 
 struct BroadcastHandler {
     topo: HashMap<String, Vec<String>>,
-    values: HashSet<i64>,
+    values: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl BroadcastHandler {
     pub fn new() -> BroadcastHandler {
         let handler = BroadcastHandler {
             topo: HashMap::new(),
-            values: HashSet::new(),
+            values: Arc::new(RwLock::new(HashSet::new())),
         };
         handler
     }
@@ -63,11 +67,18 @@ impl BroadcastHandler {
             "broadcast" => self.hdl_broadcast(runtime, req).await,
             "read" => self.hdl_read(runtime, req).await,
             "topology" => self.hdl_topology(runtime, req).await,
+            "gossip" => self.hdl_gossip(runtime, req).await,
+            "init" => {
+                Gossip::start(runtime.clone(), self.values.clone());
+                Ok(())
+            }
             _ => Err("unknown request type".into()),
         }
     }
 
     async fn hdl_broadcast(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
+        let mut values = self.values.write().await;
+
         let dests = self.topo.get(runtime.node_id());
 
         let msg_body = &req.body;
@@ -75,10 +86,10 @@ impl BroadcastHandler {
             .extra
             .get("message")
             .expect("Message was not sent")
-            .as_i64()
+            .as_u64()
             .expect("Message is not i64");
 
-        if self.values.insert(msg_num) {
+        if values.insert(msg_num) {
             if dests.is_some() {
                 let dest_nodes = dests.unwrap().to_vec();
                 for dest in dest_nodes.iter() {
@@ -102,8 +113,10 @@ impl BroadcastHandler {
     }
 
     async fn hdl_read(&self, runtime: &Runtime, req: Message) -> Result<()> {
+        let values = self.values.read().await;
+
         let mut extra = Map::new();
-        extra.insert(String::from("messages"), json!(self.values));
+        extra.insert(String::from("messages"), json!(values.clone()));
 
         let msg_body = MessageBody::from_extra(extra).with_type("read_ok");
 
@@ -129,5 +142,64 @@ impl BroadcastHandler {
         info!("Broadcast topology: {:?}", self.topo);
 
         return runtime.reply_ok(req).await;
+    }
+
+    async fn hdl_gossip(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
+        let mut values = self.values.write().await;
+        req.body
+            .extra
+            .get("state")
+            .expect("Gossip must include state")
+            .as_array()
+            .inspect(|s| info!("Received state: {:?}", s))
+            .expect("State must be an array")
+            .iter()
+            .for_each(|v| {
+                let msg = v.as_u64();
+                values.insert(msg.expect("State item is not u64"));
+            });
+        runtime.reply_ok(req).await
+    }
+}
+
+#[derive(Debug, Default)]
+struct Gossip {}
+
+impl Gossip {
+    fn start(runtime: Runtime, values_ref: Arc<RwLock<HashSet<u64>>>) {
+        let neighbors = Vec::from_iter(runtime.neighbours().cloned());
+
+        if neighbors.is_empty() {
+            info!("Neighbor is empty");
+            return;
+        }
+
+        info!("Neighbors: {:?}", neighbors);
+
+        tokio::spawn(async move {
+            info!("Gossip starts");
+
+            let mut msg_id = 0;
+            loop {
+                let rnd = random::<usize>() % neighbors.len();
+                let dest_id = neighbors.get(rnd).unwrap();
+
+                let curr_values = values_ref.read().await;
+                let mut extra = Map::new();
+                let nodes = curr_values.iter().cloned().collect::<Vec<_>>();
+
+                extra.insert(String::from("state"), json!(nodes));
+                let msg = MessageBody::from_extra(extra)
+                    .with_type("gossip")
+                    .and_msg_id(msg_id);
+
+                info!("Gossip to dest_id={} msg_id={}", dest_id, msg_id);
+
+                let _ = runtime.send_async(dest_id, msg);
+                msg_id += 1;
+
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        });
     }
 }
