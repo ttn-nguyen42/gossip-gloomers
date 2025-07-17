@@ -6,6 +6,7 @@ use maelstrom::{Node, Result, Runtime, done, protocol::Message};
 use serde_json::{Map, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -13,7 +14,7 @@ fn main() -> Result<()> {
 
 async fn try_main() -> Result<()> {
     let runtime = Runtime::new();
-    let bc_handler = BroadcastHandler::new();
+    let bc_handler = BroadcastHandler::new(&runtime);
     let handler = Arc::new(Handler::new(bc_handler));
     runtime.with_handler(handler).run().await
 }
@@ -44,18 +45,57 @@ impl Handler {
     }
 }
 
-#[derive(Clone)]
 struct BroadcastHandler {
     topo: HashMap<String, Vec<String>>,
     values: HashSet<i64>,
+    tx: Sender<BroadcastMessage>,
+}
+
+#[derive(Debug)]
+struct BroadcastMessage {
+    dests: Vec<String>,
+    message: i64,
+    msg_id: u64,
+}
+
+impl BroadcastMessage {
+    pub fn into_body(&self) -> MessageBody {
+        let mut extra = Map::new();
+        extra.insert(String::from("message"), json!(self.message));
+
+        MessageBody::from_extra(extra)
+            .and_msg_id(self.msg_id)
+            .with_type("broadcast")
+    }
 }
 
 impl BroadcastHandler {
-    pub fn new() -> BroadcastHandler {
-        BroadcastHandler {
+    pub fn new(runtime: &Runtime) -> BroadcastHandler {
+        let (tx, rx) = channel(1024);
+
+        let handler = BroadcastHandler {
             topo: HashMap::new(),
             values: HashSet::new(),
-        }
+            tx: tx,
+        };
+
+        handler.consume_forward(rx, runtime.clone());
+        handler
+    }
+
+    fn consume_forward(&self, mut rx: Receiver<BroadcastMessage>, runtime: Runtime) {
+        tokio::spawn(async move {
+            while let Some(qmsg) = rx.recv().await {
+                let msg_body = qmsg.into_body();
+                for dest in qmsg.dests.iter() {
+                    let send_res = runtime.send_async(dest, &msg_body);
+                    if let Err(err) = send_res {
+                        info!("Failed to broadcast message: {}", err)
+                    }
+                    info!("Broadcast ok to dest={} message={}", dest, qmsg.message)
+                }
+            }
+        });
     }
 
     pub async fn handle(&mut self, runtime: &Runtime, req: Message) -> Result<()> {
@@ -80,17 +120,17 @@ impl BroadcastHandler {
 
         if self.values.insert(msg_num) {
             if dests.is_some() {
-                for dest in dests.unwrap() {
-                    info!(
-                        "Sending msg_id req={} resp={} to dest={} message={}",
-                        req.body.msg_id, msg_body.msg_id, dest, msg_num,
-                    );
-                    let mut send_msg = msg_body.clone();
-                    send_msg
-                        .extra
-                        .insert(String::from("message"), json!(msg_num));
-                    runtime.call_async(dest, send_msg)
-                }
+                let dest_nodes = dests.unwrap().to_vec();
+                info!(
+                    "Queuing msg_id req={} resp={} to dest={:?} message={}",
+                    req.body.msg_id, msg_body.msg_id, dest_nodes, msg_num,
+                );
+                let qmsg = BroadcastMessage {
+                    dests: dest_nodes,
+                    message: msg_num,
+                    msg_id: req.body.msg_id,
+                };
+                let _ = self.tx.send(qmsg).await;
             }
         }
 
