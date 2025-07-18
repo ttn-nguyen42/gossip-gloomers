@@ -1,4 +1,4 @@
-use std::{cmp::max, collections::HashMap, sync::Arc, time::Duration};
+use std::{cmp::max, collections::HashMap, ops::Add, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use log::info;
@@ -66,6 +66,7 @@ impl Counter {
             RequestType::Add { delta } => {
                 info!("Add delta={}", delta);
                 self.add(runtime.node_id(), delta).await;
+                self.replicate(runtime, neighbors, delta).await;
                 return runtime.reply_ok(req).await;
             }
             RequestType::Read => {
@@ -87,8 +88,13 @@ impl Counter {
                     runtime.clone(),
                     runtime.node_id().to_string(),
                     neighbors,
-                    Duration::from_millis(100),
+                    Duration::from_millis(1000),
                 );
+                return runtime.reply_ok(req).await;
+            }
+            RequestType::Replicate {delta} => { 
+                info!("Replication received");
+                self.add(&req.src, delta).await;
                 return runtime.reply_ok(req).await;
             }
         }
@@ -131,6 +137,14 @@ impl Counter {
         counter_writer.insert(node_id.to_string(), curr_count.unwrap() + delta);
     }
 
+    async fn replicate(&self, runtime: &Runtime, neighbors: Vec<String>, delta: i64) {
+        for neighbor in neighbors {
+            let mut extra = Map::new();
+            extra.insert("delta".to_string(), json!(delta));
+            runtime.call_async(&neighbor, MessageBody::from_extra(extra).with_type("replicate"));
+        }
+    }
+
     async fn replace_state(&self, node_id: &str, state: i64) {
         let mut counter_writer = self.counter.write().await;
         let curr_state = counter_writer.get(node_id).cloned();
@@ -154,6 +168,7 @@ enum RequestType {
     Add { delta: i64 },
     Read,
     Full { state: i64 },
+    Replicate { delta: i64},
 }
 
 impl RequestType {
@@ -177,6 +192,15 @@ impl RequestType {
                     .expect("'state' not a i64");
 
                 Some(RequestType::Full { state: state })
+            }
+            "replicate" => {
+                let delta = metadata
+                    .get("delta")
+                    .expect("missing 'delta' argument")
+                    .as_i64()
+                    .expect("'delta' is not i64");
+
+                Some(RequestType::Replicate { delta: delta })
             }
             "init" => Some(RequestType::Init),
             _ => None,
