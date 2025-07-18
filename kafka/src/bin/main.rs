@@ -4,10 +4,12 @@ use async_trait::async_trait;
 use log::info;
 use maelstrom::{
     Node, Result, Runtime, done,
+    kv::{KV, Storage, lin_kv},
     protocol::{Message, MessageBody},
 };
 use serde_json::{Map, json};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
+use tokio_context::context::Context;
 
 fn main() -> Result<()> {
     Runtime::init(try_main())
@@ -16,7 +18,7 @@ fn main() -> Result<()> {
 async fn try_main() -> Result<()> {
     let runtime = Runtime::new();
 
-    let handler = Arc::new(Handler::new());
+    let handler = Arc::new(Handler::new(runtime.clone()));
 
     runtime.with_handler(handler).run().await
 }
@@ -44,69 +46,165 @@ impl Node for Handler {
 }
 
 impl Handler {
-    fn new() -> Handler {
+    fn new(runtime: Runtime) -> Handler {
         Handler {
-            kafka: Arc::new(Kafka::new()),
+            kafka: Arc::new(Kafka::new(runtime)),
         }
     }
 }
 
 struct Kafka {
-    log: Arc<Mutex<Log>>,
-    offsets: Arc<RwLock<HashMap<String, usize>>>,
-
+    store: Arc<RwLock<Storage>>,
 }
 
 impl Kafka {
-    fn new() -> Kafka {
+    fn new(runtime: Runtime) -> Kafka {
         Kafka {
-            log: Arc::new(Mutex::new(Log::new())),
-            offsets: Arc::new(RwLock::new(HashMap::new())),
+            store: Arc::new(RwLock::new(lin_kv(runtime))),
         }
     }
 
     async fn send(&self, key: String, value: i64) -> ResponseType {
-        let mut log = self.log.lock().await;
-        let entry = log.append(&key, value);
-        info!(
-            "Sent Kafka key={} value={} offset={}",
-            key, value, entry.offset
-        );
+        let store = self.store.write().await;
+        let (ctx, ctx_hdl) = Context::new();
+        let offset_key = StorageKey::Offset { key: key.clone() };
+        let latest_offset = store.get(ctx, offset_key.to_str()).await;
+
+        let mut offset: i32;
+        if let Err(_) = latest_offset {
+            offset = 0;
+        } else {
+            offset = latest_offset.unwrap();
+            offset += 1;
+        }
+        ctx_hdl.cancel();
+
+        loop {
+            let (ctx, ctx_hdl) = Context::new();
+            let cas_res = store
+                .cas(ctx, offset_key.to_str(), offset - 1, offset, true)
+                .await;
+            if let Err(_) = cas_res {
+                println!("Outdated offset local_cur={}", offset - 1);
+                offset += 1;
+                ctx_hdl.cancel();
+                continue;
+            }
+            ctx_hdl.cancel();
+            break;
+        }
+
+        info!("Put log key={} value={} offset={}", key, value, offset);
+
+        let log_key = StorageKey::Entry {
+            key: key.clone(),
+            offset: offset as usize,
+        };
+
+        let (ctx, ctx_hdl) = Context::new();
+        let _ = store
+            .put(ctx, log_key.to_str(), value)
+            .await
+            .expect("Failed to put key into lin-kv");
+
+        ctx_hdl.cancel();
+
         ResponseType::SendOk {
-            offset: entry.offset,
+            offset: offset as usize,
         }
     }
 
     async fn poll(&self, offsets: HashMap<String, usize>) -> ResponseType {
-        let log = self.log.lock().await;
+        let store = self.store.read().await;
         info!("Polling Kafka offsets={:?}", offsets);
 
         let mut msgs = HashMap::new();
         for (key, offset) in offsets {
-            let entries = log.poll(key.as_str(), offset);
-            msgs.insert(key, entries.iter().map(|e| e.as_arr()).collect());
+            let (ctx, ctx_hdl) = Context::new();
+            let latest_key = StorageKey::Offset { key: key.clone() };
+            let latest = store.get(ctx, latest_key.to_str()).await;
+            if let Err(_) = latest {
+                msgs.insert(key.clone(), Vec::new());
+                ctx_hdl.cancel();
+                continue;
+            }
+            let latest_offset: usize = latest.unwrap();
+            ctx_hdl.cancel();
+
+            let mut key_msgs = Vec::new();
+            for offset in offset..(latest_offset + 1) {
+                let (ctx, ctx_hdl) = Context::new();
+                let entry_key = StorageKey::Entry {
+                    key: key.clone(),
+                    offset: offset,
+                };
+                let value_res = store.get(ctx, entry_key.to_str()).await;
+                if let Err(_) = value_res {
+                    ctx_hdl.cancel();
+                    break;
+                }
+                let entry = Entry::key_value(offset, value_res.unwrap());
+                key_msgs.push(entry.as_arr());
+                ctx_hdl.cancel();
+            }
+
+            msgs.insert(key.clone(), key_msgs);
         }
 
         ResponseType::PollOk { msgs: msgs }
     }
 
     async fn commit(&self, offsets: HashMap<String, usize>) -> ResponseType {
-        let mut map = self.offsets.write().await;
+        let store = self.store.write().await;
         info!("Commit Kafka offsets={:?}", offsets);
 
         for (key, offset) in offsets {
-            map.insert(key, offset);
+            let (ctx, ctx_hdl) = Context::new();
+            let commit_key = StorageKey::Commit { key: key.clone() };
+
+            let committed;
+            let curr_committed = store.get(ctx, commit_key.to_str()).await;
+            if let Err(_) = curr_committed {
+                committed = offset;
+            } else {
+                committed = curr_committed.unwrap();
+            }
+
+            if committed > offset {
+                info!(
+                    "Provided key={} offset={} outdated curr={}, skipping",
+                    key.clone(),
+                    offset,
+                    committed
+                );
+            } else {
+                let (ctx, ctx_hdl) = Context::new();
+                let commit_key = StorageKey::Commit { key: key.clone() };
+                let _ = store
+                    .put(ctx, commit_key.to_str(), offset)
+                    .await
+                    .expect(format!("Failed to put latest commit for key '{}'", key).as_str());
+                ctx_hdl.cancel();
+            }
+            ctx_hdl.cancel();
         }
         ResponseType::CommitOk
     }
 
     async fn list_offsets(&self, keys: Vec<String>) -> ResponseType {
-        let map = self.offsets.read().await;
+        let store = self.store.read().await;
 
         let mut result = HashMap::new();
         for key in keys.clone() {
-            let cl_key = key.clone();
-            result.insert(key, map.get(cl_key.as_str()).cloned().unwrap_or(0));
+            let (ctx, ctx_hdl) = Context::new();
+            let commit_key = StorageKey::Commit { key: key.clone() };
+            let commit_res = store.get(ctx, commit_key.to_str()).await;
+            ctx_hdl.cancel();
+            if let Err(_) = commit_res {
+                result.insert(key.clone(), 0);
+            } else {
+                result.insert(key.clone(), commit_res.unwrap());
+            }
         }
 
         info!("List Kafka offsets keys={:?} offsets={:?}", keys, result);
@@ -228,51 +326,6 @@ impl ResponseType {
     }
 }
 
-#[derive(Default, Debug, Clone)]
-struct Log {
-    queue: HashMap<String, Vec<Entry>>,
-}
-
-impl Log {
-    fn new() -> Log {
-        Log {
-            queue: HashMap::new(),
-        }
-    }
-
-    fn append(&mut self, key: &str, value: i64) -> Entry {
-        if !self.queue.contains_key(key) {
-            let mut start = Vec::new();
-            let entry = Entry::key_value(0, value);
-            start.push(entry.clone());
-            self.queue.insert(key.to_string(), start);
-            return entry;
-        }
-
-        let curr = self.queue.get_mut(key).unwrap();
-        let entry = Entry::key_value(curr.len(), value);
-        curr.push(entry.clone());
-        return entry;
-    }
-
-    fn poll(&self, key: &str, offset: usize) -> Vec<Entry> {
-        if self.queue.contains_key(key) {
-            let part = self.queue.get(key);
-            if part.is_none() {
-                return Vec::new();
-            }
-            let part_w = part.unwrap();
-            if offset >= part_w.len() {
-                return Vec::new();
-            }
-
-            return part_w[offset..].to_vec();
-        }
-
-        Vec::new()
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Entry {
     offset: usize,
@@ -289,5 +342,21 @@ impl Entry {
 
     fn as_arr(&self) -> [i64; 2] {
         [self.offset as i64, self.value]
+    }
+}
+
+enum StorageKey {
+    Entry { key: String, offset: usize },
+    Offset { key: String },
+    Commit { key: String },
+}
+
+impl StorageKey {
+    fn to_str(&self) -> String {
+        match self {
+            StorageKey::Entry { key, offset } => format!("entry_{}_{}", key, offset),
+            StorageKey::Offset { key } => format!("latestoffset_{}", key),
+            StorageKey::Commit { key } => format!("committed_{}", key),
+        }
     }
 }
