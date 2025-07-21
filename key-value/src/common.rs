@@ -99,6 +99,8 @@ impl Operation {
                 args.push(json!(key));
                 if result.is_some() {
                     args.push(json!(result.unwrap()));
+                } else {
+                    args.push(Value::Null);
                 }
             }
             Operation::Write { key, value } => {
@@ -132,6 +134,7 @@ impl Operation {
     }
 }
 
+#[derive(Debug)]
 pub enum Response {
     TransactOk { txn: Vec<Operation> },
     Cluster { body: MessageBody },

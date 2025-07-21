@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use maelstrom::{Node, Result, Runtime, done, protocol::Message};
+use log::info;
+use maelstrom::{Node, Result, Runtime, protocol::Message};
 use tokio::sync::Mutex;
 use tokio_context::context::Context;
 
@@ -41,7 +42,7 @@ impl Node for Handler {
                     let body = resp.as_body();
                     let res = runtime.reply(msg.clone(), body).await;
                     if let Err(err) = res {
-                        println!("Failed to send reply: {}", err);
+                        info!("Failed to send reply: {}", err);
                         return Err(err.into());
                     }
                     Ok(())
@@ -53,12 +54,14 @@ impl Node for Handler {
                         if is_leader {
                             let res = cluster.apply(txn).await;
                             if let Err(err) = res {
+                                info!("Failed to apply: {}", err);
                                 return Err(err.into());
                             }
                             let _ = send_reply(&runtime, &msg, res.unwrap()).await;
                         } else {
                             let res = self.forward_to_leader(&runtime, &msg, &leader_id).await;
                             if let Err(err) = res {
+                                info!("Failed to forward to leader: {}", err);
                                 return Err(err.into());
                             }
                             let _ = send_reply(&runtime, &msg, res.unwrap()).await;
@@ -67,39 +70,48 @@ impl Node for Handler {
                         let sm_guard = self.state_machine.lock().await;
                         let res = sm_guard.apply(txn).await;
                         if let Err(err) = res {
+                            info!("Failed to apply: {}", err);
                             return Err(err.into());
                         }
                         let _ = send_reply(&runtime, &msg, res.unwrap()).await;
                     }
                 }
+
+                Ok(())
             }
             Request::Init => {
                 let mut cluster_guard = self.cluster.lock().await;
                 if cluster_guard.is_none() {
-                    let state_machine = StateMachine::new();
-                    let mut cluster =
-                        Cluster::new(runtime.clone(), "DATA".to_string(), state_machine);
+                    let mut cluster = Cluster::new(
+                        runtime.clone(),
+                        "./DATA".to_string(),
+                        self.state_machine.clone(),
+                    );
                     cluster.start().await;
                     *cluster_guard = Some(cluster);
                 }
+                let _ = runtime.reply_ok(msg.clone()).await;
+
+                Ok(())
             }
             Request::Cluster { body } => {
                 let cluster_guard = self.cluster.lock().await;
                 if let Some(cluster) = cluster_guard.as_ref() {
                     let res = cluster.handle_cluster(Request::Cluster { body }).await;
                     if let Err(err) = res {
-                        return Err(err.into());
+                        panic!("Failed to handle cluster: {}", err);
                     }
                     let response = res.expect("result is not of type Response");
                     let body = response.as_body();
                     let res = runtime.reply(msg.clone(), body).await;
                     if let Err(err) = res {
-                        return Err(err.into());
+                        panic!("Failed to handle cluster: {}", err);
                     }
                 }
+
+                Ok(())
             }
         }
-        done(runtime, msg)
     }
 }
 

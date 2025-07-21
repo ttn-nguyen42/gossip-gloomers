@@ -18,7 +18,7 @@ mod tests {
 
         let persistence = Persistence::restore(test_dir).await.unwrap();
         let mut persistence = persistence;
-        persistence.persist(false, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
 
         let _restored = Persistence::restore(test_dir).await.unwrap();
 
@@ -36,7 +36,7 @@ mod tests {
         fs::create_dir_all(test_dir).unwrap();
 
         let mut persistence = Persistence::restore(test_dir).await.unwrap();
-        persistence.persist(false, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
 
         let _restored = Persistence::restore(test_dir).await.unwrap();
 
@@ -54,8 +54,8 @@ mod tests {
         fs::create_dir_all(test_dir).unwrap();
 
         let mut persistence = Persistence::restore(test_dir).await.unwrap();
-        persistence.persist(false, 0).await.unwrap();
-        persistence.persist(true, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
+        persistence.persist(true, 0, None).await.unwrap();
 
         let _restored = Persistence::restore(test_dir).await.unwrap();
 
@@ -73,7 +73,7 @@ mod tests {
         fs::create_dir_all(test_dir).unwrap();
 
         let mut persistence = Persistence::restore(test_dir).await.unwrap();
-        persistence.persist(false, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
 
         let _restored = Persistence::restore(test_dir).await.unwrap();
 
@@ -91,7 +91,7 @@ mod tests {
         fs::create_dir_all(test_dir).unwrap();
 
         let mut persistence = Persistence::restore(test_dir).await.unwrap();
-        persistence.persist(false, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
 
         for _ in 0..3 {
             let _restored = Persistence::restore(test_dir).await.unwrap();
@@ -111,7 +111,7 @@ mod tests {
         fs::create_dir_all(test_dir).unwrap();
 
         let mut persistence = Persistence::restore(test_dir).await.unwrap();
-        persistence.persist(false, 0).await.unwrap();
+        persistence.persist(false, 0, None).await.unwrap();
 
         let metadata_path = format!("{}/metadata.dat", test_dir);
         assert!(Path::new(&metadata_path).exists());

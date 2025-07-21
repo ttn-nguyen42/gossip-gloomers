@@ -9,13 +9,14 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::io::Error;
+use std::path::Path;
 use std::sync::Arc;
 use std::{cmp::max, time::Duration};
-use tokio::fs::{File, OpenOptions};
+use tokio::fs::{File, OpenOptions, canonicalize, create_dir_all};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::spawn;
-use tokio::sync::RwLock;
 use tokio::sync::oneshot::{Sender, channel};
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tokio_context::context::Context;
 
@@ -35,7 +36,7 @@ pub struct Cluster {
 pub struct Inner {
     members: Vec<String>,
     node_id: String,
-    state_machine: StateMachine,
+    state_machine: Arc<Mutex<StateMachine>>,
 
     heartbeat_dur: Duration,
     election_timeout: Instant,
@@ -58,9 +59,7 @@ pub struct Inner {
 
 struct ClusterState {
     id: String,
-    // next log index to send to this node
     next_index: u64,
-    // last log index replicated to this node
     match_index: u64,
 }
 
@@ -72,7 +71,7 @@ enum State {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-enum Vote {
+pub enum Vote {
     For { node_id: String },
     NotYet,
 }
@@ -87,7 +86,11 @@ impl Vote {
 }
 
 impl Cluster {
-    pub fn new(runtime: Runtime, meta_dir: String, state_machine: StateMachine) -> Cluster {
+    pub fn new(
+        runtime: Runtime,
+        meta_dir: String,
+        state_machine: Arc<Mutex<StateMachine>>,
+    ) -> Cluster {
         let members: Vec<String> = runtime.nodes().iter().cloned().collect();
         let node_id = runtime.node_id().to_string();
         let mut votes = HashMap::new();
@@ -139,16 +142,45 @@ impl Cluster {
         if let Err(err) = deser_persist {
             panic!("failed to deserialize persistence: {}", err);
         }
-        inner_l.persist = Some(deser_persist.unwrap());
+        let persist = deser_persist.unwrap();
+
+        inner_l.log = persist.log.clone();
+        inner_l.cur_term = persist.current_term;
+        inner_l.commit_index = persist.current_term;
+        inner_l.last_applied = 0;
+
+        if !persist.voted_for.is_empty() {
+            let voted_node_id = persist.voted_for.clone();
+            if inner_l.members.contains(&voted_node_id) {
+                inner_l.votes.insert(
+                    voted_node_id.clone(),
+                    Vote::For {
+                        node_id: voted_node_id,
+                    },
+                );
+            }
+        }
+
+        inner_l.persist = Some(persist);
 
         let cluster_arc = Arc::new(self.clone());
-        spawn(Cluster::run(cluster_arc));
+
+        let (tx, rx) = channel();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+
+        drop(inner_l);
+
+        spawn(Cluster::run(cluster_arc, tx));
+        let _ = rx.await;
+        info!("Leader chosen, init completed");
     }
 
-    async fn run(self: Arc<Self>) {
+    async fn run(self: Arc<Self>, leader_chosen: Arc<Mutex<Option<Sender<()>>>>) {
         let mut inner_l = self.inner.write().await;
         inner_l.reset_elect_timeout().await;
         drop(inner_l);
+
+        let mut leader_notified = false;
 
         loop {
             let mut inner_l = self.inner.write().await;
@@ -161,14 +193,29 @@ impl Cluster {
 
             match state {
                 State::Leader => {
+                    if !leader_notified {
+                        if let Some(sender) = leader_chosen.lock().await.take() {
+                            let _ = sender.send(());
+                        }
+                        leader_notified = true;
+                    }
                     inner_l.heartbeat().await;
                     inner_l.advance_commit_index().await;
                 }
                 State::Follower => {
+                    info!("Becoming follower");
+                    if !leader_notified {
+                        if let Some(sender) = leader_chosen.lock().await.take() {
+                            let _ = sender.send(());
+                        }
+                        leader_notified = true;
+                    }
+
                     inner_l.timeout().await;
                     inner_l.advance_commit_index().await;
                 }
                 State::Candidate => {
+                    info!("Becoming candidate");
                     inner_l.timeout().await;
                     inner_l.become_leader().await;
                 }
@@ -279,11 +326,13 @@ impl Cluster {
 
         let n_new_entries = inner_l.add_to_log(prev_log_index, entries, leader_commit);
 
+        let cur_term = inner_l.cur_term;
+        let votes = inner_l.votes.clone();
         let persisted = inner_l
             .persist
             .as_mut()
             .unwrap()
-            .persist(n_new_entries != 0, n_new_entries)
+            .persist(n_new_entries != 0, n_new_entries, Some((&cur_term, &votes)))
             .await;
         if let Err(err) = persisted {
             panic!("failed to persist cluster data: {}", err);
@@ -375,7 +424,14 @@ impl Cluster {
                 },
             );
             inner_l.reset_elect_timeout().await;
-            let persisted = inner_l.persist.as_mut().unwrap().persist(false, 0).await;
+            let cur_term = inner_l.cur_term;
+            let votes = inner_l.votes.clone();
+            let persisted = inner_l
+                .persist
+                .as_mut()
+                .unwrap()
+                .persist(false, 0, Some((&cur_term, &votes)))
+                .await;
             if let Err(err) = persisted {
                 panic!("failed to persist cluster data: {}", err);
             }
@@ -409,7 +465,14 @@ impl Cluster {
         };
         inner_l.log.push(new_entry);
 
-        let persisted = inner_l.persist.as_mut().unwrap().persist(true, 1).await;
+        let cur_term = inner_l.cur_term;
+        let votes = inner_l.votes.clone();
+        let persisted = inner_l
+            .persist
+            .as_mut()
+            .unwrap()
+            .persist(true, 1, Some((&cur_term, &votes)))
+            .await;
         if let Err(err) = persisted {
             panic!("failed to persist cluster data: {}", err);
         }
@@ -497,7 +560,8 @@ impl Inner {
             // len(log.operations) == 0 is a noop committed by the leader.
             if !log_entry.operations.is_empty() {
                 debug!("Entry applied: {}", self.last_applied);
-                let res = self.state_machine.apply(log_entry.operations.clone()).await;
+                let sm_guard = self.state_machine.lock().await;
+                let res = sm_guard.apply(log_entry.operations.clone()).await;
                 let result = log_entry.result.take();
 
                 if let Err(err) = res {
@@ -574,7 +638,7 @@ impl Inner {
         let has_timed_out = now > self.election_timeout;
 
         if has_timed_out {
-            info!("Timed out, starting electron");
+            info!("Timed out, starting election");
             self.state = State::Candidate;
             self.cur_term += 1;
 
@@ -592,7 +656,14 @@ impl Inner {
             }
 
             self.reset_elect_timeout().await;
-            let persisted = self.persist.as_mut().unwrap().persist(false, 0).await;
+            let cur_term = self.cur_term;
+            let votes = &self.votes;
+            let persisted = self
+                .persist
+                .as_mut()
+                .unwrap()
+                .persist(false, 0, Some((&cur_term, votes)))
+                .await;
             if let Err(err) = persisted {
                 panic!("failed to persist cluster data: {}", err)
             }
@@ -629,7 +700,7 @@ impl Inner {
             self.persist
                 .as_mut()
                 .unwrap()
-                .persist(true, 1)
+                .persist(true, 1, Some((&self.cur_term, &self.votes)))
                 .await
                 .expect("persist failed");
 
@@ -786,7 +857,7 @@ impl Inner {
             self.persist
                 .as_mut()
                 .unwrap()
-                .persist(false, 0)
+                .persist(false, 0, Some((&self.cur_term, &self.votes)))
                 .await
                 .expect("persist failed");
         }
@@ -961,41 +1032,84 @@ pub struct Persistence {
     fd: File,
     current_term: u64,
     log: Vec<Entry>,
-    voted_for: u64,
+    voted_for: String,
 }
 
 impl Persistence {
     pub async fn open_metadata(meta_dir: &str) -> File {
+        if !Path::new(meta_dir).exists() {
+            create_dir_all(meta_dir)
+                .await
+                .expect("Failed to create metadata directory");
+        }
+
         let metadata_path = format!("{}/metadata.dat", meta_dir);
         OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(metadata_path)
+            .open(&metadata_path)
             .await
             .expect("Failed to open metadata file")
+    }
+
+    pub async fn get_metadata_absolute_path(meta_dir: &str) -> std::io::Result<std::path::PathBuf> {
+        let metadata_path = format!("{}/metadata.dat", meta_dir);
+        let path = Path::new(&metadata_path);
+
+        // Get absolute path
+        let absolute_path = canonicalize(path).await?;
+        Ok(absolute_path)
     }
 
     pub async fn persist(
         &mut self,
         write_log: bool,
         n_new_entries: usize,
-    ) -> std::result::Result<(), std::io::Error> {
+        cluster_state: Option<(&u64, &HashMap<String, Vote>)>,
+    ) -> Result<(), Error> {
         let mut n_new_entries = n_new_entries;
 
         if n_new_entries == 0 && write_log {
             n_new_entries = self.log.len();
         }
 
+        // Update persistence state from cluster state if provided
+        if let Some((cur_term, votes)) = cluster_state {
+            self.current_term = *cur_term;
+
+            // Find the node this node voted for
+            let mut voted_for = String::new();
+            for (node_id, vote) in votes {
+                if let Vote::For {
+                    node_id: voted_node_id,
+                } = vote
+                {
+                    if node_id == voted_node_id {
+                        voted_for = voted_node_id.clone();
+                        break;
+                    }
+                }
+            }
+            self.voted_for = voted_for;
+        }
+
         self.fd.seek(SeekFrom::Start(0)).await?;
 
         let mut page = [0u8; PAGE_SIZE];
         // --------------------------------------------------------
-        // | Current term (8b) | Voted for (8b) | Log length (8b) |
+        // | Current term (8b) | Voted for length (8b) | Voted for (var) | Log length (8b) |
         // --------------------------------------------------------
         page[0..8].copy_from_slice(&self.current_term.to_le_bytes());
-        page[8..16].copy_from_slice(&self.voted_for.to_le_bytes());
-        page[16..24].copy_from_slice(&(self.log.len() as u64).to_le_bytes());
+        let voted_for_bytes = self.voted_for.as_bytes();
+        let voted_for_len = voted_for_bytes.len() as u64;
+        page[8..16].copy_from_slice(&voted_for_len.to_le_bytes());
+
+        // Copy voted_for string (up to 64 bytes to fit in page)
+        let max_voted_for_len = min(voted_for_bytes.len(), 64);
+        page[16..16 + max_voted_for_len].copy_from_slice(&voted_for_bytes[..max_voted_for_len]);
+
+        page[80..88].copy_from_slice(&(self.log.len() as u64).to_le_bytes());
 
         self.fd.write_all(&page).await?;
 
@@ -1021,6 +1135,8 @@ impl Persistence {
 
     pub async fn restore(path: &str) -> std::result::Result<Persistence, Error> {
         let mut fd = Persistence::open_metadata(path).await;
+        let absolute_path = Persistence::get_metadata_absolute_path(path).await;
+        info!("Absolute path: {:?}", absolute_path);
 
         fd.seek(SeekFrom::Start(0)).await?;
 
@@ -1036,7 +1152,7 @@ impl Persistence {
                 fd,
                 current_term: 0,
                 log: Vec::new(),
-                voted_for: 0,
+                voted_for: String::new(),
             });
         }
 
@@ -1045,8 +1161,9 @@ impl Persistence {
         }
 
         let current_term = u64::from_le_bytes(page[0..8].try_into().unwrap());
-        let voted_for = u64::from_le_bytes(page[8..16].try_into().unwrap());
-        let len_log = u64::from_le_bytes(page[16..24].try_into().unwrap());
+        let voted_for_len = u64::from_le_bytes(page[8..16].try_into().unwrap()) as usize;
+        let voted_for = String::from_utf8_lossy(&page[16..16 + min(voted_for_len, 64)]).to_string();
+        let len_log = u64::from_le_bytes(page[80..88].try_into().unwrap());
 
         let mut log = Vec::new();
 
@@ -1070,6 +1187,7 @@ impl Persistence {
             }
         }
 
+        info!("Restored log with {} entries", len_log);
         if len_log == 0 {
             log.push(Entry {
                 term: 0,
@@ -1270,6 +1388,26 @@ impl ClusterResponse {
                 Ok(ClusterResponse::VoteOk { granted, term })
             }
             _ => Err(format!("Unknown cluster response type: {}", typ)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_metadata_absolute_path() {
+        // This test demonstrates how to get the absolute path
+        let result = Persistence::get_metadata_absolute_path("./DATA").await;
+
+        if let Ok(absolute_path) = result {
+            println!("Metadata file absolute path: {:?}", absolute_path);
+            assert!(absolute_path.is_absolute());
+            assert!(absolute_path.ends_with("metadata.dat"));
+        } else {
+            // If the directory doesn't exist yet, that's okay for this test
+            println!("Directory doesn't exist yet, which is expected");
         }
     }
 }
