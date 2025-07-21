@@ -1,6 +1,7 @@
 pub mod cluster;
 pub mod common;
-pub mod machine;
+pub mod handler;
+pub mod state;
 
 #[cfg(test)]
 mod tests;

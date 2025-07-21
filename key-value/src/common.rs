@@ -4,6 +4,7 @@ use serde_json::{Map, Value, json};
 
 pub enum Request {
     Transact { txn: Vec<Operation> },
+    Cluster { body: MessageBody },
     Init,
 }
 
@@ -63,7 +64,10 @@ impl Request {
                     .collect();
                 Request::Transact { txn: ops }
             }
-            _ => panic!("invalid request: {}", req.get_type()),
+            _ => {
+                let body = req.body.clone();
+                Request::Cluster { body }
+            }
         }
     }
 }
@@ -115,6 +119,7 @@ impl Operation {
 
 pub enum Response {
     TransactOk { txn: Vec<Operation> },
+    Cluster { body: MessageBody },
 }
 
 impl Response {
@@ -126,6 +131,9 @@ impl Response {
                 extra.insert("txn_".to_string(), json!(args));
 
                 MessageBody::from_extra(extra).with_type("txn_ok")
+            }
+            Response::Cluster { body } => {
+                MessageBody::from_extra(body.extra.clone()).with_type(body.typ.clone())
             }
         }
     }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use key_value::machine::{Handler};
+use key_value::handler::{Handler};
 use maelstrom::{Result, Runtime};
 
 fn main() -> Result<()> {

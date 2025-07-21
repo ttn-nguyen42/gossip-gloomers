@@ -251,6 +251,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bincode",
+ "futures",
  "log",
  "maelstrom-node",
  "rand",
