@@ -109,6 +109,21 @@ impl Operation {
         args
     }
 
+    pub fn from_arr(arr: &Vec<Value>) -> Result<Operation, String> {
+        let op_type = arr.get(0).unwrap().as_str().unwrap();
+        match op_type {
+            "r" => Ok(Operation::Read {
+                key: arr.get(1).unwrap().as_i64().unwrap(),
+                result: None,
+            }),
+            "w" => Ok(Operation::Write {
+                key: arr.get(1).unwrap().as_i64().unwrap(),
+                value: arr.get(2).unwrap().as_i64().unwrap(),
+            }),
+            _ => Err(format!("Invalid operation type: {}", op_type)),
+        }
+    }
+
     pub fn get_type(&self) -> &str {
         match self {
             Operation::Read { key: _, result: _ } => "r",
@@ -128,13 +143,31 @@ impl Response {
         match self {
             Response::TransactOk { txn } => {
                 let args: Vec<Vec<Value>> = txn.iter().map(|op| op.as_arr()).collect();
-                extra.insert("txn_".to_string(), json!(args));
+                extra.insert("txn".to_string(), json!(args));
 
                 MessageBody::from_extra(extra).with_type("txn_ok")
             }
             Response::Cluster { body } => {
                 MessageBody::from_extra(body.extra.clone()).with_type(body.typ.clone())
             }
+        }
+    }
+
+    pub fn from_body(body: &MessageBody) -> Result<Response, String> {
+        match body.typ.as_str() {
+            "txn_ok" => {
+                let txn = body
+                    .extra
+                    .get("txn")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|op| Operation::from_arr(op.as_array().unwrap()).unwrap())
+                    .collect();
+                Ok(Response::TransactOk { txn })
+            }
+            _ => Err(format!("Invalid response type: {}", body.typ)),
         }
     }
 }

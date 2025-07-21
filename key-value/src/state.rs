@@ -1,4 +1,4 @@
-use crate::common::Operation;
+use crate::common::{Operation, Response};
 
 #[derive(Clone, Copy)]
 pub struct StateMachine {}
@@ -8,7 +8,7 @@ impl StateMachine {
         StateMachine {}
     }
 
-    pub async fn apply(&self, ops: Vec<Operation>) -> Result<(), String> {
-        Ok(())
+    pub async fn apply(&self, ops: Vec<Operation>) -> Result<Response, String> {
+        Ok(Response::TransactOk { txn: ops.clone() })
     }
 }

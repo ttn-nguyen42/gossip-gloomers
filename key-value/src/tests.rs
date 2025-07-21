@@ -133,6 +133,7 @@ mod tests {
                     result: Some(200),
                 },
             ],
+            result: None,
         };
 
         let serialized = entry.serialize();

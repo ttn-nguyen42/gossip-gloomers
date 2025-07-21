@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use std::cmp::min;
 use std::collections::HashMap;
+use std::fmt::{self, Debug};
 use std::io::Error;
 use std::sync::Arc;
 use std::{cmp::max, time::Duration};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::spawn;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tokio::sync::oneshot::{Sender, channel};
 use tokio::time::Instant;
 use tokio_context::context::Context;
 
@@ -27,7 +29,7 @@ const ENTRY_SIZE: usize = 128;
 #[derive(Clone)]
 pub struct Cluster {
     meta_dir: String,
-    inner: Arc<Mutex<Inner>>,
+    inner: Arc<RwLock<Inner>>,
 }
 
 pub struct Inner {
@@ -47,6 +49,7 @@ pub struct Inner {
     log: Vec<Entry>,
 
     stopped: bool,
+    leader_id: Option<String>,
 
     persist: Option<Persistence>,
     votes: HashMap<String, Vote>,
@@ -119,15 +122,16 @@ impl Cluster {
             votes: votes,
             nodes: nodes,
             state_machine: state_machine,
+            leader_id: None,
         };
         Cluster {
             meta_dir: meta_dir,
-            inner: Arc::new(Mutex::new(inner)),
+            inner: Arc::new(RwLock::new(inner)),
         }
     }
 
     pub async fn start(&mut self) {
-        let mut inner_l = self.inner.lock().await;
+        let mut inner_l = self.inner.write().await;
         inner_l.state = State::Candidate;
         inner_l.stopped = false;
 
@@ -142,12 +146,12 @@ impl Cluster {
     }
 
     async fn run(self: Arc<Self>) {
-        let mut inner_l = self.inner.lock().await;
+        let mut inner_l = self.inner.write().await;
         inner_l.reset_elect_timeout().await;
         drop(inner_l);
 
         loop {
-            let mut inner_l = self.inner.lock().await;
+            let mut inner_l = self.inner.write().await;
 
             if inner_l.stopped {
                 return;
@@ -233,7 +237,7 @@ impl Cluster {
         entries: Vec<Entry>,
         leader_commit: u64,
     ) -> Result<ClusterResponse, String> {
-        let mut inner_l = self.inner.lock().await;
+        let mut inner_l = self.inner.write().await;
 
         inner_l.update_term(term, leader_id.clone()).await;
 
@@ -241,6 +245,8 @@ impl Cluster {
         if term == inner_l.cur_term && inner_l.state == State::Candidate {
             inner_l.state = State::Follower;
         }
+
+        inner_l.leader_id = Some(leader_id.clone());
 
         if inner_l.state != State::Follower {
             debug!(
@@ -312,7 +318,7 @@ impl Cluster {
         last_log_index: u64,
         last_log_term: u64,
     ) -> Result<ClusterResponse, String> {
-        let mut inner_l = self.inner.lock().await;
+        let mut inner_l = self.inner.write().await;
         inner_l.update_term(term, candidate_id.clone()).await;
         info!(
             "Received vote request from {} for term {}",
@@ -386,17 +392,20 @@ impl Cluster {
         })
     }
 
-    pub async fn apply(&self, ops: Vec<Operation>) -> Result<(), String> {
-        let mut inner_l = self.inner.lock().await;
-        if !inner_l.is_leader() {
+    pub async fn apply(&self, ops: Vec<Operation>) -> Result<Response, String> {
+        let mut inner_l = self.inner.write().await;
+        let (is_leader, _) = inner_l.is_leader().await;
+        if !is_leader {
             return Err("node is not leader".to_string());
         }
 
         info!("Replicating operations as log entry: {:?}", ops);
 
+        let (tx, rx) = channel();
         let new_entry = Entry {
             term: inner_l.cur_term,
             operations: ops,
+            result: Some(tx),
         };
         inner_l.log.push(new_entry);
 
@@ -413,7 +422,20 @@ impl Cluster {
         let _ = inner_l.append_entries().await;
         info!("Entry replicated, cur_term: {}", inner_l.cur_term);
 
-        Ok(())
+        // prevent deadlock waiting for advance_commit_index to run
+        drop(inner_l);
+
+        let res = rx.await;
+        if let Err(err) = res {
+            return Err(err.to_string());
+        }
+        let res = res.unwrap();
+        Ok(res.unwrap())
+    }
+
+    pub async fn is_leader(&self) -> (bool, String) {
+        let inner_l = self.inner.read().await;
+        inner_l.is_leader().await
     }
 }
 
@@ -427,7 +449,14 @@ impl Inner {
         self.election_timeout = Instant::now() + interval_duration;
     }
 
-    async fn heartbeat(&mut self) {}
+    async fn heartbeat(&mut self) {
+        let time_for_heartbeat = Instant::now() > self.heartbeat_timeout;
+        if time_for_heartbeat {
+            self.heartbeat_timeout = Instant::now() + self.heartbeat_dur;
+            debug!("Sending heartbeat");
+            let _ = self.append_entries().await;
+        }
+    }
 
     async fn advance_commit_index(&mut self) {
         // Leader can update commitIndex on quorum.
@@ -463,14 +492,29 @@ impl Inner {
                 break;
             }
 
-            let log_entry = &self.log[log_index];
+            let log_entry = &mut self.log[log_index];
 
             // len(log.operations) == 0 is a noop committed by the leader.
             if !log_entry.operations.is_empty() {
                 debug!("Entry applied: {}", self.last_applied);
                 let res = self.state_machine.apply(log_entry.operations.clone()).await;
+                let result = log_entry.result.take();
+
                 if let Err(err) = res {
                     debug!("Failed to apply entry {}: {}", self.last_applied, err);
+                    if let Some(result) = result {
+                        let _ = result.send(Err(err.to_string()));
+                    } else {
+                        panic!("No result channel for entry {}", self.last_applied);
+                    }
+                } else {
+                    if let Some(result) = result {
+                        let _ = result.send(Ok(Response::TransactOk {
+                            txn: log_entry.operations.clone(),
+                        }));
+                    } else {
+                        panic!("No result channel for entry {}", self.last_applied);
+                    }
                 }
             }
 
@@ -580,6 +624,7 @@ impl Inner {
             self.log.push(Entry {
                 term: self.cur_term,
                 operations: Vec::new(),
+                result: None,
             });
             self.persist
                 .as_mut()
@@ -756,8 +801,13 @@ impl Inner {
             .clone();
     }
 
-    fn is_leader(&self) -> bool {
-        self.state == State::Leader
+    async fn is_leader(&self) -> (bool, String) {
+        if self.state == State::Leader {
+            (true, self.node_id.clone())
+        } else {
+            let leader_id = self.leader_id.clone().unwrap_or_default();
+            (false, leader_id)
+        }
     }
 }
 
@@ -828,10 +878,33 @@ impl RpcService {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Entry {
     pub term: u64,
     pub operations: Vec<Operation>,
+
+    #[serde(skip)]
+    pub result: Option<Sender<Result<Response, String>>>,
+}
+
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        Entry {
+            term: self.term,
+            operations: self.operations.clone(),
+            result: None,
+        }
+    }
+}
+
+impl Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Entry {{ term: {}, operations: {:?} }}",
+            self.term, self.operations
+        )
+    }
 }
 
 impl Entry {
@@ -876,7 +949,11 @@ impl Entry {
         let operations = bincode::deserialize(operations_bytes)
             .map_err(|e| format!("Failed to deserialize operations: {}", e))?;
 
-        Ok(Entry { term, operations })
+        Ok(Entry {
+            term,
+            operations,
+            result: None,
+        })
     }
 }
 
@@ -997,6 +1074,7 @@ impl Persistence {
             log.push(Entry {
                 term: 0,
                 operations: Vec::new(),
+                result: None,
             });
         }
 
