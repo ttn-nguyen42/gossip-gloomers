@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -27,22 +28,24 @@ func NewServer(n *ms.Node) *Server {
 	}
 
 	s.n.Handle("init", s.handleInit)
-	s.n.Handle("tx", s.forwardable(s.handleTx))
+	s.n.Handle("txn", s.forwardTxn(s.handleTx))
+	s.n.Handle("forward_txn", s.handleForwardTxn)
 	return s
 }
 
 func (s *Server) handleInit(msg ms.Message) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	log.Printf("Received init from %s", msg.Src)
 
 	if s.raft != nil {
-		return nil
+		s.mu.Unlock()
+		return s.n.Reply(msg, NewInitOkReply())
 	}
 
 	applyCh := make(chan raft.LogEntry)
 	s.raft = raft.NewRaft(s.n, s.n.ID(), s.n.NodeIDs(), applyCh)
+
+	log.Printf("Starting raft")
 
 	go func() {
 		for entry := range applyCh {
@@ -58,6 +61,8 @@ func (s *Server) handleInit(msg ms.Message) error {
 		}
 	}()
 
+	s.mu.Unlock()
+
 	for s.raft.GetLeader() == "" {
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -65,7 +70,7 @@ func (s *Server) handleInit(msg ms.Message) error {
 	return s.n.Reply(msg, NewInitOkReply())
 }
 
-func (s *Server) handleTx(msg ms.Message) error {
+func (s *Server) runTx(msg ms.Message) *Tx {
 	tx := NewTx(msg)
 
 	index, _, isLeader := s.raft.Apply(tx)
@@ -80,7 +85,7 @@ func (s *Server) handleTx(msg ms.Message) error {
 
 	select {
 	case completedTx := <-doneCh:
-		return s.n.Reply(msg, NewTxOkReply(completedTx))
+		return completedTx
 	case <-time.After(5 * time.Second):
 		s.mu.Lock()
 		delete(s.pendingTxs, index)
@@ -88,6 +93,16 @@ func (s *Server) handleTx(msg ms.Message) error {
 		log.Fatalf("timeout: %d", index)
 	}
 	return nil
+}
+
+func (s *Server) handleTx(msg ms.Message) error {
+	reply := s.runTx(msg)
+	return s.n.Reply(msg, NewTxOkReply(reply))
+}
+
+func (s *Server) handleForwardTxn(msg ms.Message) error {
+	reply := s.runTx(msg)
+	return s.n.Reply(msg, NewForwardTxnReply(reply))
 }
 
 func applyTx(store *kv.Store, txReq *Tx) {
@@ -116,21 +131,35 @@ func applyTx(store *kv.Store, txReq *Tx) {
 	}
 }
 
-func (s *Server) forwardable(handler func(msg ms.Message) error) func(msg ms.Message) error {
+func (s *Server) forwardTxn(handler func(msg ms.Message) error) func(msg ms.Message) error {
 	return func(msg ms.Message) error {
 		if s.raft.IsLeader() {
+			log.Printf("I am leader, handling txn")
 			return handler(msg)
 		}
 
 		leader := s.raft.GetLeader()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		resp, err := s.n.SyncRPC(ctx, leader, msg.Body)
+
+		var body map[string]any
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+		body["type"] = "forward_txn"
+
+		resp, err := s.n.SyncRPC(ctx, leader, body)
 		if err != nil {
 			return err
 		}
 
-		return s.n.Reply(msg, resp.Body)
+		var reply Reply
+		if err := json.Unmarshal(resp.Body, &reply); err != nil {
+			return err
+		}
+		reply.Type = "txn_ok"
+
+		return s.n.Reply(msg, reply)
 	}
 }
 

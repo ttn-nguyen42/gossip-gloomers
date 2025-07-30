@@ -79,9 +79,6 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) becomeFollower(term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = ""
@@ -90,11 +87,8 @@ func (rf *Raft) becomeFollower(term int) {
 }
 
 func (rf *Raft) becomeCandidate() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.state = Candidate
-	rf.currentTerm++
+	rf.currentTerm += 1
 	rf.votedFor = rf.nodeId
 	rf.leaderId = ""
 	rf.electionTimer.Reset(rf.randomElectionTimeout())
@@ -103,9 +97,6 @@ func (rf *Raft) becomeCandidate() {
 }
 
 func (rf *Raft) becomeLeader() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	rf.state = Leader
 	rf.leaderId = rf.nodeId
 	rf.nextIndex = make(map[string]int)
@@ -190,6 +181,9 @@ func (rf *Raft) HandleRequestVote(msg ms.Message) error {
 	reply := RequestVoteReply{Type: "request_vote_ok", Term: rf.currentTerm, VoteGranted: false}
 
 	if req.Term < rf.currentTerm {
+		log.Printf("Request vote term is less than current term, rejecting")
+		log.Printf("Current term: %d, request term: %d", rf.currentTerm, req.Term)
+
 		return rf.n.Reply(msg, reply)
 	}
 
@@ -201,6 +195,8 @@ func (rf *Raft) HandleRequestVote(msg ms.Message) error {
 		rf.votedFor = req.CandidateID
 		reply.VoteGranted = true
 	}
+
+	log.Printf("Responding to request vote from %s", msg.Src)
 
 	return rf.n.Reply(msg, reply)
 }
